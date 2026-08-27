@@ -1,0 +1,9 @@
+fastapi[standard]
+uvicorn[standard]
+sqlalchemy
+pydantic
+pandas
+openpyxl
+psutil
+pytest
+black
