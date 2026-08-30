@@ -6,4 +6,6 @@ pandas
 openpyxl
 psutil
 pytest
+openai
+ollama
 black

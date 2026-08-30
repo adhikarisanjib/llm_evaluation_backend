@@ -26,6 +26,18 @@ class ModelRead(ORMModel):
     is_enabled: bool
 
 
+class ModelUpdate(BaseModel):
+    name: str | None = None
+    display_name: str | None = None
+    adapter_type: str | None = None
+    base_url: str | None = None
+    api_key_env: str | None = None
+    metadata_json: dict | None = None
+    is_enabled: bool | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class TaskCreate(BaseModel):
     id: int | None = Field(default=None, ge=1)
     title: str = Field(min_length=1)
@@ -86,6 +98,21 @@ class TaskRead(ORMModel):
     programming_language: str
 
 
+class TaskUpdate(BaseModel):
+    title: str | None = None
+    question: str | None = None
+    starter_code: str | None = None
+    difficulty: str | None = None
+    task_type: str | None = None
+
+    tests: list[str] | None = None
+    regression_tests: list[str] | None = None
+
+    programming_language: str | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class TaskExcelUploadResult(BaseModel):
     imported_count: int
     task_ids: list[int]
@@ -119,6 +146,20 @@ class ExperimentRead(ORMModel):
 class ExperimentDetail(ExperimentRead):
     models: list[ModelRead] = Field(default_factory=list)
     tasks: list[TaskRead] = Field(default_factory=list)
+
+
+class ExperimentUpdate(BaseModel):
+    name: str | None = None
+
+    attempts_per_task: int | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    max_tokens: int | None = None
+
+    model_ids: list[int] | None = None
+    task_ids: list[int] | None = None
+
+    model_config = ConfigDict(extra="forbid")
 
 
 class RunTestResultRead(ORMModel):

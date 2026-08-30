@@ -1,46 +1,66 @@
-import time
+from time import perf_counter
 
-import httpx
+from ollama import AsyncClient
 
 from app.llm_clients.base import BaseLLMAdapter, LLMResponse
 
 
 class OllamaAdapter(BaseLLMAdapter):
+
     async def generate(
-        self, *, model_config, prompt: str, settings: dict
+        self,
+        model_config,
+        prompt: str,
+        settings: dict,
     ) -> LLMResponse:
-        payload = {
-            "model": model_config.name,
-            "prompt": prompt,
-            "stream": False,
-            "options": {
-                "temperature": settings.get("temperature", 0.2),
-                "top_p": settings.get("top_p", 0.95),
-                "num_predict": settings.get("max_tokens", 1024),
-            },
-        }
 
-        started = time.perf_counter()
-        async with httpx.AsyncClient(timeout=300) as client:
-            response = await client.post(
-                f"{model_config.base_url.rstrip('/')}/api/generate",
-                json=payload,
-            )
-            response.raise_for_status()
-            data = response.json()
+        host = (model_config.base_url or "http://localhost:11434").rstrip("/")
 
-        latency_ms = (time.perf_counter() - started) * 1000
-        eval_count = data.get("eval_count")
-        eval_duration = data.get("eval_duration")
+        client = AsyncClient(host=host)
+
+        options = {}
+
+        if settings.get("temperature") is not None:
+            options["temperature"] = settings["temperature"]
+
+        if settings.get("top_p") is not None:
+            options["top_p"] = settings["top_p"]
+
+        if settings.get("max_tokens") is not None:
+            options["num_predict"] = settings["max_tokens"]
+
+        started = perf_counter()
+
+        response = await client.generate(
+            model=model_config.name,
+            prompt=prompt,
+            stream=False,
+            options=options,
+        )
+
+        latency_ms = (perf_counter() - started) * 1000
+
+        content = response.response or ""
+
+        input_tokens = response.prompt_eval_count
+        output_tokens = response.eval_count
+
         tokens_per_second = None
-        if eval_count is not None and eval_duration:
-            tokens_per_second = eval_count / (eval_duration / 1_000_000_000)
+
+        if (
+            response.eval_count
+            and response.eval_duration
+            and response.eval_duration > 0
+        ):
+            tokens_per_second = response.eval_count / (
+                response.eval_duration / 1_000_000_000
+            )
 
         return LLMResponse(
-            content=data.get("response", ""),
-            input_tokens=data.get("prompt_eval_count"),
-            output_tokens=eval_count,
+            content=content,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
             latency_ms=latency_ms,
             tokens_per_second=tokens_per_second,
-            raw_response=data,
+            raw_response=response.model_dump(),
         )

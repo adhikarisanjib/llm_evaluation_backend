@@ -3,11 +3,12 @@ from io import BytesIO
 from pathlib import Path
 
 import httpx
+from aiosqlite import IntegrityError
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from openpyxl import load_workbook
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -20,12 +21,15 @@ from app.schemas import (
     ExperimentCreate,
     ExperimentDetail,
     ExperimentRead,
+    ExperimentUpdate,
     ModelCreate,
     ModelRead,
+    ModelUpdate,
     RunRead,
     TaskCreate,
     TaskExcelUploadResult,
     TaskRead,
+    TaskUpdate,
 )
 from app.settings import settings
 
@@ -97,6 +101,16 @@ async def health():
     return {"status": "ok"}
 
 
+@router.get("/models/{model_id}", response_model=ModelRead)
+async def get_model(model_id: int, db: AsyncSession = Depends(get_db)):
+    model = await db.get(LLMModel, model_id)
+
+    if not model:
+        raise HTTPException(404, "Model not found")
+
+    return model
+
+
 @router.post("/models", response_model=ModelRead)
 async def create_model(payload: ModelCreate, db: AsyncSession = Depends(get_db)):
     obj = LLMModel(**payload.model_dump())
@@ -110,6 +124,67 @@ async def create_model(payload: ModelCreate, db: AsyncSession = Depends(get_db))
 async def list_models(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(LLMModel).order_by(LLMModel.id))
     return result.scalars().all()
+
+
+@router.patch("/models/{model_id}", response_model=ModelRead)
+async def update_model(
+    model_id: int, payload: ModelUpdate, db: AsyncSession = Depends(get_db)
+):
+    model = await db.get(LLMModel, model_id)
+
+    if not model:
+        raise HTTPException(404, "Model not found")
+
+    update_data = payload.model_dump(exclude_unset=True)
+
+    for field, value in update_data.items():
+        setattr(model, field, value)
+
+    try:
+        await db.commit()
+        await db.refresh(model)
+
+    except Exception:
+        await db.rollback()
+        raise
+
+    return model
+
+
+@router.delete("/models/{model_id}", status_code=204)
+async def delete_model(model_id: int, db: AsyncSession = Depends(get_db)):
+    model = await db.get(LLMModel, model_id)
+
+    if not model:
+        raise HTTPException(404, "Model not found")
+
+    run_count = await db.scalar(
+        select(Run).where(Run.model_id == model_id).with_only_columns(func.count())
+    )
+
+    if run_count:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Model cannot be deleted because it is referenced by {run_count} run(s). Disable the model instead if it should no longer be used."
+            ),
+        )
+
+    try:
+        await db.delete(model)
+        await db.commit()
+
+    except IntegrityError:
+        await db.rollback()
+
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Model cannot be deleted because it is referenced by an experiment."
+            ),
+        )
+
+    return None
 
 
 @router.post("/models/sync-ollama", response_model=list[ModelRead])
@@ -352,6 +427,67 @@ async def get_task(task_id: int, db: AsyncSession = Depends(get_db)):
     return task
 
 
+@router.patch("/tasks/{task_id}", response_model=TaskRead)
+async def update_task(
+    task_id: int, payload: TaskUpdate, db: AsyncSession = Depends(get_db)
+):
+    task = await db.get(Task, task_id)
+
+    if not task:
+        raise HTTPException(404, "Task not found")
+
+    update_data = payload.model_dump(exclude_unset=True)
+
+    for field, value in update_data.items():
+        setattr(task, field, value)
+
+    try:
+        await db.commit()
+        await db.refresh(task)
+
+    except Exception:
+        await db.rollback()
+        raise
+
+    return task
+
+
+@router.delete("/tasks/{task_id}", status_code=204)
+async def delete_task(task_id: int, db: AsyncSession = Depends(get_db)):
+    task = await db.get(Task, task_id)
+
+    if not task:
+        raise HTTPException(404, "Task not found")
+
+    run_count = await db.scalar(
+        select(func.count()).select_from(Run).where(Run.task_id == task_id)
+    )
+
+    if run_count:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Task cannot be deleted because it is referenced by {run_count} run(s). Deleting it would invalidate existing experiment results."
+            ),
+        )
+
+    try:
+        await db.delete(task)
+        await db.commit()
+
+    except IntegrityError:
+        await db.rollback()
+
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Task cannot be deleted because it is currently referenced by one or more experiments."
+            ),
+        )
+
+    return None
+
+
 @router.post("/experiments", response_model=ExperimentRead)
 async def create_experiment(
     payload: ExperimentCreate, db: AsyncSession = Depends(get_db)
@@ -408,6 +544,122 @@ async def get_experiment(experiment_id: int, db: AsyncSession = Depends(get_db))
     if not experiment:
         raise HTTPException(404, "Experiment not found")
     return experiment
+
+
+@router.patch("/experiments/{experiment_id}", response_model=ExperimentDetail)
+async def update_experiment(
+    experiment_id: int, payload: ExperimentUpdate, db: AsyncSession = Depends(get_db)
+):
+    result = await db.execute(
+        select(Experiment)
+        .options(
+            selectinload(Experiment.models),
+            selectinload(Experiment.tasks),
+        )
+        .where(Experiment.id == experiment_id)
+    )
+
+    experiment = result.scalar_one_or_none()
+
+    if not experiment:
+        raise HTTPException(404, "Experiment not found")
+
+    update_data = payload.model_dump(exclude_unset=True)
+
+    model_ids = update_data.pop("model_ids", None)
+
+    task_ids = update_data.pop("task_ids", None)
+
+    for field, value in update_data.items():
+        setattr(experiment, field, value)
+
+    if model_ids is not None:
+
+        if not model_ids:
+            raise HTTPException(400, "Experiment must contain at least one model")
+
+        result = await db.execute(select(LLMModel).where(LLMModel.id.in_(model_ids)))
+
+        models = result.scalars().all()
+
+        if len(models) != len(set(model_ids)):
+            raise HTTPException(400, "One or more model IDs do not exist")
+
+        disabled = [model.id for model in models if not model.is_enabled]
+
+        if disabled:
+            raise HTTPException(
+                400,
+                f"Disabled models cannot be selected: {disabled}",
+            )
+
+        experiment.models = models
+
+    if task_ids is not None:
+
+        if not task_ids:
+            raise HTTPException(400, "Experiment must contain at least one task")
+
+        result = await db.execute(select(Task).where(Task.id.in_(task_ids)))
+
+        tasks = result.scalars().all()
+
+        if len(tasks) != len(set(task_ids)):
+            raise HTTPException(400, "One or more task IDs do not exist")
+
+        experiment.tasks = tasks
+
+    try:
+        await db.commit()
+
+    except Exception:
+        await db.rollback()
+        raise
+
+    # Reload relationships after commit
+    result = await db.execute(
+        select(Experiment)
+        .options(
+            selectinload(Experiment.models),
+            selectinload(Experiment.tasks),
+        )
+        .where(Experiment.id == experiment_id)
+    )
+
+    return result.scalar_one()
+
+
+@router.delete("/experiments/{experiment_id}", status_code=204)
+async def delete_experiment(experiment_id: int, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(Experiment)
+        .options(
+            selectinload(Experiment.models),
+            selectinload(Experiment.tasks),
+        )
+        .where(Experiment.id == experiment_id)
+    )
+
+    experiment = result.scalar_one_or_none()
+
+    if not experiment:
+        raise HTTPException(404, "Experiment not found")
+
+    try:
+        await db.delete(experiment)
+        await db.commit()
+
+    except IntegrityError as exc:
+        await db.rollback()
+
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Experiment could not be deleted. Check that experiment runs are configured with delete cascade."
+            ),
+        ) from exc
+
+    return None
 
 
 @router.post("/experiments/{experiment_id}/clone", response_model=ExperimentRead)
